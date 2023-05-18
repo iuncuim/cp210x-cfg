@@ -61,11 +61,14 @@
 #define ITEM_MANUF 0x3714
 #define ITEM_SERI  0x3704
 #define ITEM_MODEL 0x370b
+#define ITEM_PCONF 0x370c
 #define ITEM_FLUSH 0x370d
 #define ITEM_MODE  0x3711
 
 #define USB_PWR_DSCR_100MA 0x32
 #define USB_PWR_DSCR_500MA 0xfa
+
+#define EF_RESERVED_1 0x20
 
 /* Config structore for 2102n devices is from
    https://www.silabs.com/documents/public/application-notes/AN978-cp210x-usb-to-uart-api-specification.pdf 
@@ -334,9 +337,9 @@ static const config_param_t cfg_items[] =
   { ITEM_NAME, 0, 255, CFG_STR, MODELS_ALL, read_str, "Name: %s\n" },
   { ITEM_MANUF, 0, 255, CFG_STR, MODELS_ALL, read_str, "Manufacturer: %s\n" },
   { ITEM_SERI, 0, MAX_SERIAL, CFG_STR, MODELS_ALL, read_str, "Serial: %s\n" },
-
   { ITEM_FLUSH, 0, 1, CFG_INT8,  MODEL(5), read_vendor, "Flush buffers: %x\n" },
   { ITEM_MODE,  0, 2, CFG_INT16, MODEL(5), read_vendor, "SCI/ECI mode: %04hx\n" },
+  { ITEM_PCONF,  0, 15, CFG_INT16, MODEL(5), read_vendor, "Port Config: %x %x %x %x %x %x\n" },
 };
 
 static void print_cp210x_cfg (libusb_device_handle *cp210x)
@@ -380,7 +383,13 @@ static void print_cp210x_cfg (libusb_device_handle *cp210x)
            }
            break;
          case CFG_INT16:
-           printf (item->fmtstr, ((uint16_t)buffer[0] << 8) | buffer[1]);
+           if (item->value == ITEM_PCONF) {
+             printf (item->fmtstr, ((uint16_t)buffer[0] << 8) | buffer[1],
+                    ((uint16_t)buffer[4] << 8) | buffer[5],
+                    ((uint16_t)buffer[10] << 8) | buffer[11],
+                    buffer[13], buffer[12], buffer[14] & ~EF_RESERVED_1);
+           } else
+             printf (item->fmtstr, ((uint16_t)buffer[0] << 8) | buffer[1]);
            break;
          case CFG_STR:
            printf (item->fmtstr, buffer);
@@ -422,6 +431,17 @@ static bool cp210x_set_pid (libusb_device_handle *cp210x, uint16_t pid)
 static bool cp210x_set_flush (libusb_device_handle *cp210x, uint8_t bitmap)
 {
   return cp210x_set_cfg (cp210x, ITEM_FLUSH, 0, &bitmap, 1);
+}
+
+static const uint8_t rs485_config[] = {
+	0x59, 0x51, 0x0, 0x0, 0xf6, 0xfe, 0x59, 0x51,
+	0x0, 0x0, 0xf6, 0xfe, 0x10, 0x1c, 0x10
+};
+
+static bool cp2105_set_rs485 (libusb_device_handle *cp210x)
+{
+  printf ("Set RS485\n");
+  return cp210x_set_cfg (cp210x, ITEM_PCONF, 0, &rs485_config, 15);
 }
 
 static bool cp210x_set_mode (libusb_device_handle *cp210x, uint16_t mode)
@@ -597,6 +617,7 @@ void syntax (void)
 "  -t 0/1        Toggle between internal and user specified serial (CP2101n only)\n"
 "  -L 0/1        Enable TX/RX led output (CP2101n only)\n"
 "  -I 0/1        Toggle between 100mA and 500mA usb power descriptor. This flag works only in conjunction with -x flag.\n"
+"  -R            Program the GPIO.1_ECI pin for RS-485 mode (CP2105 only, active low)\n"
 "  -H            Print a hexdump of the current device's config\n"
 "  -x            Enable this tool's experimental features. See README.\n"
 "\n"
@@ -630,6 +651,7 @@ int main (int argc, char *argv[])
   bool set_flush = false;
   uint8_t new_flush = 0x33;
   bool set_mode = false;
+  bool set_rs485 = false;
   uint16_t new_mode = 0x0000;
   bool set_name = false;
   const char *new_name = 0;
@@ -654,7 +676,7 @@ int main (int argc, char *argv[])
   int exitcode = 0;
 
   int opt;
-  while ((opt = getopt (argc, argv, "rhHlxd:m:V:P:F:M:N:S:t:C:L:I:")) != -1)
+  while ((opt = getopt (argc, argv, "rhHlRxd:m:V:P:F:M:N:S:t:C:L:I:")) != -1)
   {
     switch (opt)
     {
@@ -692,6 +714,7 @@ int main (int argc, char *argv[])
       case 'P': set_pid    = true; new_pid    = strtol (optarg, 0, 16); break;
       case 'F': set_flush  = true; new_flush  = strtol (optarg, 0, 16); break;
       case 'M': set_mode   = true; new_mode   = strtol (optarg, 0, 16); break;
+      case 'R': set_rs485  = true; break;
       case 'N': set_name   = true; new_name   = optarg; break;
       case 'S': set_serial = true; new_serial = optarg; break;
       case 'C': set_manuf  = true; new_manuf  = optarg; break;
@@ -862,13 +885,15 @@ int main (int argc, char *argv[])
       exitcode += cp210x_set_flush (cp210x, new_flush) ? 0 : 64;
     if (set_mode)
       exitcode += cp210x_set_mode (cp210x, new_mode) ? 0 : 128;
+    if (set_rs485)
+      exitcode += cp2105_set_rs485 (cp210x) ? 0 : 128;
     if (set_name)
       exitcode += cp210x_set_name (cp210x, new_name) ? 0 : 256;
     if (set_serial)
       exitcode += cp210x_set_serial (cp210x, new_serial) ? 0 : 512;
   }
 
-  if (set_vid || set_pid || set_flush || set_mode || set_name || set_serial) {
+  if (set_vid || set_pid || set_flush || set_mode || set_rs485 || set_name || set_serial) {
     cp210x_reset (cp210x);
     printf("IMPORTANT: Device needs to be replugged for some changes to take effect!\n");
   }
